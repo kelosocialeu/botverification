@@ -15,8 +15,10 @@ services:
         sync: false
       - key: BOT_SERVICE
         value: https://pds.kelosocial.eu
-      - key: TRUSTED_VERIFIERS
-        sync: false
+      - key: CERTIFICATION_REPO
+        value: kelosocial.eu
+      - key: CERTIFICATION_PDS
+        value: https://eurosky.social
       - key: PUBLIC_APPVIEW
         value: https://public.api.bsky.app
       - key: POLL_INTERVAL_MS
