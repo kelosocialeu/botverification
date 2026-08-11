@@ -12,6 +12,7 @@ const BOT_IDENTIFIER = process.env.BOT_IDENTIFIER
 const BOT_PASSWORD = process.env.BOT_PASSWORD
 const PORT = Number(process.env.PORT || 3000)
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 60_000)
+const STARTUP_GRACE_MS = Number(process.env.STARTUP_GRACE_MS || 10 * 60_000)
 
 if (!BOT_IDENTIFIER || !BOT_PASSWORD) {
   throw new Error('BOT_IDENTIFIER et BOT_PASSWORD sont obligatoires.')
@@ -20,9 +21,8 @@ if (!BOT_IDENTIFIER || !BOT_PASSWORD) {
 const bot = new AtpAgent({ service: BOT_SERVICE })
 const registryAgent = new AtpAgent({ service: CERTIFICATION_PDS })
 
-// URI -> dernier CID observé pendant la vie du processus.
+const processStartedAt = Date.now()
 const seenRecordCids = new Map()
-let initialSnapshotDone = false
 let pollRunning = false
 
 let botDid = null
@@ -102,14 +102,10 @@ function rebuildTrustedVerifierRegistry(records) {
   }
 
   trustedVerifiers = next
-  console.log(`[registry] ${trustedVerifiers.size} certificateur(s) de confiance détecté(s) automatiquement`)
+  console.log(`[registry] ${trustedVerifiers.size} certificateur(s) de confiance détecté(s)`)
 }
 
 function announcementRkey(record) {
-  // Une certification Kelo possède une URI ATProto stable et unique.
-  // Le hash de cette URI devient la rkey du post du bot : même après un
-  // redémarrage ou avec deux instances simultanées, la même certification
-  // ne peut pas créer plusieurs posts.
   return crypto.createHash('sha256').update(record.uri).digest('hex')
 }
 
@@ -136,11 +132,11 @@ function buildAnnouncement(record, verifier) {
   const verifierMention = `@${verifier.handle}`
 
   const text = [
-    '✅ Nouveau compte certifié',
+    '✅ Nouvelle certification sur Kelo Social',
     '',
-    `${subjectMention} a reçu une certification sur Kelo Social, attribuée par ${verifierMention}.`,
+    `${subjectMention} vient d’être certifié par ${verifierMention}.`,
     '',
-    'Cette certification a été délivrée par un certificateur de confiance reconnu par Kelo Social.',
+    'Cette certification a été attribuée par un certificateur de confiance reconnu par Kelo Social.',
   ].join('\n')
 
   const facets = [
@@ -161,9 +157,7 @@ async function postAlreadyExists(rkey) {
       rkey,
     })
     return true
-  } catch (error) {
-    const status = error?.status || error?.response?.status
-    if (status === 400 || status === 404) return false
+  } catch {
     return false
   }
 }
@@ -174,7 +168,7 @@ async function publishAnnouncement(record, verifier) {
   const rkey = announcementRkey(record)
 
   if (await postAlreadyExists(rkey)) {
-    console.log(`[duplicate] annonce déjà publiée pour ${record.uri}`)
+    console.log(`[duplicate] annonce déjà existante pour ${record.uri}`)
     return { duplicate: true, uri: `at://${botDid}/${POST_COLLECTION}/${rkey}` }
   }
 
@@ -197,31 +191,21 @@ async function publishAnnouncement(record, verifier) {
     console.log(`[post] annonce publiée: ${response.data.uri}`)
     return { duplicate: false, uri: response.data.uri }
   } catch (error) {
-    // Protection supplémentaire contre les courses entre deux instances :
-    // si une autre instance a créé la rkey juste avant nous, on considère
-    // simplement l'annonce comme déjà publiée.
     if (await postAlreadyExists(rkey)) {
-      console.log(`[duplicate] annonce créée par une autre instance pour ${record.uri}`)
+      console.log(`[duplicate] annonce déjà créée pour ${record.uri}`)
       return { duplicate: true, uri: `at://${botDid}/${POST_COLLECTION}/${rkey}` }
     }
     throw error
   }
 }
 
-function seedInitialSnapshot(records) {
-  for (const record of records) {
-    seenRecordCids.set(record.uri, record.cid)
-  }
-  initialSnapshotDone = true
-  console.log(`[snapshot] ${records.length} record(s) existant(s) mémorisé(s)`)
+function isRecentAtStartup(record) {
+  const issuedAt = Date.parse(record.issuedAt)
+  if (!Number.isFinite(issuedAt)) return false
+  return issuedAt >= processStartedAt - STARTUP_GRACE_MS
 }
 
 async function processCertifiedRecords(records) {
-  if (!initialSnapshotDone) {
-    seedInitialSnapshot(records)
-    return
-  }
-
   const certifiedRecords = records
     .filter((record) => record.status === 'certified')
     .sort((a, b) => Date.parse(a.issuedAt) - Date.parse(b.issuedAt))
@@ -229,6 +213,13 @@ async function processCertifiedRecords(records) {
   for (const record of certifiedRecords) {
     const previousCid = seenRecordCids.get(record.uri)
     if (previousCid === record.cid) continue
+
+    // Au premier passage après un redémarrage, on ne reprend que les
+    // certifications récentes. Les anciennes sont simplement mémorisées.
+    if (previousCid === undefined && !isRecentAtStartup(record)) {
+      seenRecordCids.set(record.uri, record.cid)
+      continue
+    }
 
     const verifier = trustedVerifiers.get(record.issuerDid)
 
@@ -239,6 +230,10 @@ async function processCertifiedRecords(records) {
       seenRecordCids.set(record.uri, record.cid)
       continue
     }
+
+    console.log(
+      `[detect] certification @${record.subjectHandle} par @${verifier.handle} (${record.uri}, CID ${record.cid})`,
+    )
 
     try {
       const result = await publishAnnouncement(record, verifier)
@@ -252,11 +247,10 @@ async function processCertifiedRecords(records) {
         duplicatePrevented: result.duplicate,
         detectedAt: new Date().toISOString(),
       }
-      console.log(
-        `[certification] @${verifier.handle} a certifié @${record.subjectHandle} (CID ${record.cid})`,
-      )
+      console.log(`[certification] publication terminée pour @${record.subjectHandle}`)
     } catch (error) {
       console.error(`[post] échec pour ${record.uri}:`, error?.message || error)
+      lastError = error instanceof Error ? error.message : String(error)
     }
   }
 }
@@ -277,7 +271,7 @@ async function poll() {
     await processCertifiedRecords(records)
 
     lastSuccessfulPollAt = new Date().toISOString()
-    lastError = null
+    if (!lastError) lastError = null
   } catch (error) {
     lastError = error instanceof Error ? error.message : String(error)
     console.error('[poll] erreur:', error)
@@ -291,6 +285,7 @@ async function start() {
   botDid = bot.session?.did || null
   console.log(`[bot] connecté: ${BOT_IDENTIFIER}${botDid ? ` (${botDid})` : ''}`)
   console.log(`[registry] ${CERTIFICATION_REPO} / ${COLLECTION} via ${CERTIFICATION_PDS}`)
+  console.log(`[startup] reprise des certifications des ${Math.round(STARTUP_GRACE_MS / 60000)} dernières minutes`)
 
   await poll()
 
@@ -319,7 +314,7 @@ app.get('/', (_req, res) => {
     trustedVerifiers: [...trustedVerifiers.values()],
     trustedVerifierCount: trustedVerifiers.size,
     pollIntervalMs: POLL_INTERVAL_MS,
-    initialSnapshotDone,
+    startupGraceMs: STARTUP_GRACE_MS,
     pollRunning,
     lastDetectedCertification,
     lastSuccessfulPollAt,
@@ -331,7 +326,6 @@ app.get('/health', (_req, res) => {
   res.status(lastError ? 503 : 200).json({
     ok: !lastError,
     trustedVerifierCount: trustedVerifiers.size,
-    initialSnapshotDone,
     pollRunning,
     lastDetectedCertification,
     lastSuccessfulPollAt,
