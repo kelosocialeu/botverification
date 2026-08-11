@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: kelo-verification-bot
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: 22
+      - key: BOT_IDENTIFIER
+        sync: false
+      - key: BOT_PASSWORD
+        sync: false
+      - key: BOT_SERVICE
+        value: https://pds.kelosocial.eu
+      - key: TRUSTED_VERIFIERS
+        sync: false
+      - key: PUBLIC_APPVIEW
+        value: https://public.api.bsky.app
+      - key: POLL_INTERVAL_MS
+        value: 60000
+      - key: STARTUP_GRACE_MS
+        value: 300000
