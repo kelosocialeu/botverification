@@ -11,7 +11,6 @@ const BOT_IDENTIFIER = process.env.BOT_IDENTIFIER
 const BOT_PASSWORD = process.env.BOT_PASSWORD
 const PORT = Number(process.env.PORT || 3000)
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 60_000)
-const STARTUP_GRACE_MS = Number(process.env.STARTUP_GRACE_MS || 300_000)
 
 if (!BOT_IDENTIFIER || !BOT_PASSWORD) {
   throw new Error('BOT_IDENTIFIER et BOT_PASSWORD sont obligatoires.')
@@ -21,14 +20,17 @@ const bot = new AtpAgent({ service: BOT_SERVICE })
 const registryAgent = new AtpAgent({ service: CERTIFICATION_PDS })
 const publicAgent = new AtpAgent({ service: PUBLIC_APPVIEW })
 
-const seenCertificationUris = new Set()
-const processStartedAt = Date.now()
+// URI -> dernier CID observé. Le CID change lorsqu'un record est créé ou modifié,
+// même si son URI/rkey reste identique.
+const seenRecordCids = new Map()
+let initialSnapshotDone = false
 
 let botDid = null
 let trustedVerifiers = new Map()
 let lastSuccessfulPollAt = null
 let lastError = null
 let lastRegistryCount = 0
+let lastDetectedCertification = null
 
 function normalizeDid(value) {
   return typeof value === 'string' ? value.trim().toLowerCase() : ''
@@ -55,7 +57,7 @@ function parseCertificationRecord(item) {
 
   return {
     uri: item.uri,
-    cid: item.cid || null,
+    cid: typeof item.cid === 'string' ? item.cid : '',
     status: value.status,
     subjectDid,
     subjectHandle,
@@ -95,6 +97,7 @@ function rebuildTrustedVerifierRegistry(records) {
       handle: record.subjectHandle,
       issuedAt: record.issuedAt,
       uri: record.uri,
+      cid: record.cid,
     })
   }
 
@@ -103,12 +106,6 @@ function rebuildTrustedVerifierRegistry(records) {
   console.log(
     `[registry] ${trustedVerifiers.size} certificateur(s) de confiance détecté(s) automatiquement`,
   )
-}
-
-function isRecentEnough(record) {
-  const issuedAt = Date.parse(record.issuedAt)
-  if (!Number.isFinite(issuedAt)) return false
-  return issuedAt >= processStartedAt - STARTUP_GRACE_MS
 }
 
 async function getProfileLabel(did, fallbackHandle) {
@@ -143,20 +140,29 @@ async function publishAnnouncement(record, verifier) {
   return response.uri
 }
 
+function seedInitialSnapshot(records) {
+  for (const record of records) {
+    seenRecordCids.set(record.uri, record.cid)
+  }
+  initialSnapshotDone = true
+  console.log(`[snapshot] ${records.length} record(s) existant(s) mémorisé(s)`)
+}
+
 async function processCertifiedRecords(records) {
-  // Du plus ancien au plus récent pour conserver l'ordre des annonces.
+  if (!initialSnapshotDone) {
+    seedInitialSnapshot(records)
+    return
+  }
+
   const certifiedRecords = records
     .filter((record) => record.status === 'certified')
     .sort((a, b) => Date.parse(a.issuedAt) - Date.parse(b.issuedAt))
 
   for (const record of certifiedRecords) {
-    if (seenCertificationUris.has(record.uri)) continue
+    const previousCid = seenRecordCids.get(record.uri)
 
-    // Au démarrage, on mémorise l'historique ancien sans le republier.
-    if (!isRecentEnough(record)) {
-      seenCertificationUris.add(record.uri)
-      continue
-    }
+    // Rien n'a changé depuis le dernier scan.
+    if (previousCid === record.cid) continue
 
     // Le certificateur est découvert exclusivement depuis les records
     // status="trusted-verifier" du registre AT Protocol Kelo Social.
@@ -164,21 +170,31 @@ async function processCertifiedRecords(records) {
 
     if (!verifier) {
       console.log(
-        `[ignore] ${record.subjectHandle}: émetteur ${record.issuerDid || record.issuerHandle || 'inconnu'} non reconnu comme certificateur de confiance`,
+        `[ignore] @${record.subjectHandle}: émetteur ${record.issuerDid || record.issuerHandle || 'inconnu'} non reconnu comme certificateur de confiance`,
       )
-      seenCertificationUris.add(record.uri)
+      // On mémorise cette version mais une nouvelle modification (nouveau CID)
+      // pourra être réévaluée lors d'un prochain scan.
+      seenRecordCids.set(record.uri, record.cid)
       continue
     }
 
     try {
-      await publishAnnouncement(record, verifier)
-      seenCertificationUris.add(record.uri)
+      const postUri = await publishAnnouncement(record, verifier)
+      seenRecordCids.set(record.uri, record.cid)
+      lastDetectedCertification = {
+        subjectHandle: record.subjectHandle,
+        issuerHandle: verifier.handle,
+        recordUri: record.uri,
+        recordCid: record.cid,
+        postUri,
+        detectedAt: new Date().toISOString(),
+      }
       console.log(
-        `[certification] @${verifier.handle} a certifié @${record.subjectHandle}`,
+        `[certification] @${verifier.handle} a certifié @${record.subjectHandle} (CID ${record.cid})`,
       )
     } catch (error) {
       console.error(`[post] échec pour ${record.uri}:`, error.message)
-      // Pas marqué comme vu : nouvel essai au prochain passage.
+      // On ne mémorise pas le nouveau CID : le bot réessaiera au prochain scan.
     }
   }
 }
@@ -234,6 +250,8 @@ app.get('/', (_req, res) => {
     trustedVerifiers: [...trustedVerifiers.values()],
     trustedVerifierCount: trustedVerifiers.size,
     pollIntervalMs: POLL_INTERVAL_MS,
+    initialSnapshotDone,
+    lastDetectedCertification,
     lastSuccessfulPollAt,
     lastError,
   })
@@ -243,6 +261,8 @@ app.get('/health', (_req, res) => {
   res.status(lastError ? 503 : 200).json({
     ok: !lastError,
     trustedVerifierCount: trustedVerifiers.size,
+    initialSnapshotDone,
+    lastDetectedCertification,
     lastSuccessfulPollAt,
     lastError,
   })
