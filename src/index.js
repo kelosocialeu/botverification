@@ -100,28 +100,50 @@ function rebuildTrustedVerifierRegistry(records) {
   console.log(`[registry] ${trustedVerifiers.size} certificateur(s) de confiance détecté(s)`)
 }
 
-function markerRkey(record) {
-  // URI + date d'attribution : si une certification est révoquée puis accordée
-  // de nouveau plus tard, elle obtient un nouveau marqueur.
+// Ancienne clé conservée pour lire les marqueurs déjà créés par la version
+// précédente du bot.
+function legacyMarkerRkey(record) {
   return crypto
     .createHash('sha256')
     .update(`${record.uri}|${record.issuedAt}`)
     .digest('hex')
 }
 
-async function markerExists(record) {
-  if (!botDid) return false
+// Nouvelle clé : chaque version réelle d'un record AT Protocol possède un CID.
+// Ainsi une mise à jour en lot est détectée même si URI et issuedAt ne changent pas.
+function markerRkey(record) {
+  return crypto
+    .createHash('sha256')
+    .update(`${record.uri}|${record.cid || record.issuedAt}`)
+    .digest('hex')
+}
+
+async function getMarkerByRkey(rkey) {
+  if (!botDid) return null
 
   try {
-    await bot.com.atproto.repo.getRecord({
+    const response = await bot.com.atproto.repo.getRecord({
       repo: botDid,
       collection: MARKER_COLLECTION,
-      rkey: markerRkey(record),
+      rkey,
     })
-    return true
+    return response.data.value || null
   } catch {
-    return false
+    return null
   }
+}
+
+async function recordAlreadyHandled(record) {
+  // Nouveau marqueur exact URI + CID.
+  if (await getMarkerByRkey(markerRkey(record))) return true
+
+  // Compatibilité avec les marqueurs créés avant ce correctif.
+  const legacy = await getMarkerByRkey(legacyMarkerRkey(record))
+  if (!legacy) return false
+
+  // Si le CID enregistré est identique, c'est exactement la même version.
+  // Si le CID diffère, le record a réellement été modifié et doit être traité.
+  return typeof legacy.certificationCid === 'string' && legacy.certificationCid === record.cid
 }
 
 async function writeMarker(record, mode, postUri = '') {
@@ -205,14 +227,13 @@ async function initializePersistentBaseline(records) {
   let existing = 0
 
   for (const record of certified) {
-    if (await markerExists(record)) {
+    if (await recordAlreadyHandled(record)) {
       existing += 1
       continue
     }
 
-    // Au tout premier démarrage de cette nouvelle version, on marque les
-    // certifications déjà existantes sans les republier. Cela évite une
-    // nouvelle rafale d'anciennes annonces.
+    // Les records déjà présents lors du premier démarrage après migration sont
+    // marqués comme historique afin de ne pas republier tout l'ancien registre.
     await writeMarker(record, 'baseline')
     created += 1
   }
@@ -227,7 +248,7 @@ async function processCertifiedRecords(records) {
     .sort((a, b) => Date.parse(a.issuedAt) - Date.parse(b.issuedAt))
 
   for (const record of certifiedRecords) {
-    if (await markerExists(record)) continue
+    if (await recordAlreadyHandled(record)) continue
 
     const verifier = trustedVerifiers.get(record.issuerDid)
 
@@ -238,17 +259,18 @@ async function processCertifiedRecords(records) {
         subjectHandle: record.subjectHandle,
         issuerDid: record.issuerDid,
         issuerHandle: record.issuerHandle,
+        recordCid: record.cid,
         at: new Date().toISOString(),
       }
       console.log(
         `[ignore] @${record.subjectHandle}: ${record.issuerDid || record.issuerHandle || 'émetteur inconnu'} n'est pas un certificateur de confiance`,
       )
-      // Ne pas créer de marqueur ici : si ce compte reçoit ensuite le statut
-      // trusted-verifier, le record pourra être réévalué.
       continue
     }
 
-    console.log(`[detect] @${verifier.handle} a certifié @${record.subjectHandle}`)
+    console.log(
+      `[detect] @${verifier.handle} a certifié @${record.subjectHandle} (CID ${record.cid})`,
+    )
 
     try {
       const postUri = await publishAnnouncement(record, verifier)
@@ -269,6 +291,7 @@ async function processCertifiedRecords(records) {
         action: 'error',
         subjectHandle: record.subjectHandle,
         issuerHandle: verifier.handle,
+        recordCid: record.cid,
         error: lastError,
         at: new Date().toISOString(),
       }
@@ -334,6 +357,7 @@ app.get('/', (_req, res) => {
       recordCount: lastRegistryCount,
     },
     markerCollection: MARKER_COLLECTION,
+    markerVersion: 'uri+cid',
     baselineReady,
     trustedVerifierCount: trustedVerifiers.size,
     trustedVerifiers: [...trustedVerifiers.values()],
@@ -350,6 +374,7 @@ app.get('/health', (_req, res) => {
   res.status(lastError ? 503 : 200).json({
     ok: !lastError,
     baselineReady,
+    markerVersion: 'uri+cid',
     trustedVerifierCount: trustedVerifiers.size,
     lastDetectedCertification,
     lastDecision,
