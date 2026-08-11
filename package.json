@@ -8,10 +8,10 @@
     "start": "node src/index.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "dependencies": {
-    "@atproto/api": "^0.18.8",
+    "@atproto/api": "^0.20.16",
     "dotenv": "^16.6.1",
     "express": "^5.1.0"
   }
