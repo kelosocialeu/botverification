@@ -100,8 +100,6 @@ function rebuildTrustedVerifierRegistry(records) {
   console.log(`[registry] ${trustedVerifiers.size} certificateur(s) de confiance détecté(s)`)
 }
 
-// Ancienne clé conservée pour lire les marqueurs déjà créés par la version
-// précédente du bot.
 function legacyMarkerRkey(record) {
   return crypto
     .createHash('sha256')
@@ -109,8 +107,6 @@ function legacyMarkerRkey(record) {
     .digest('hex')
 }
 
-// Nouvelle clé : chaque version réelle d'un record AT Protocol possède un CID.
-// Ainsi une mise à jour en lot est détectée même si URI et issuedAt ne changent pas.
 function markerRkey(record) {
   return crypto
     .createHash('sha256')
@@ -134,15 +130,11 @@ async function getMarkerByRkey(rkey) {
 }
 
 async function recordAlreadyHandled(record) {
-  // Nouveau marqueur exact URI + CID.
   if (await getMarkerByRkey(markerRkey(record))) return true
 
-  // Compatibilité avec les marqueurs créés avant ce correctif.
   const legacy = await getMarkerByRkey(legacyMarkerRkey(record))
   if (!legacy) return false
 
-  // Si le CID enregistré est identique, c'est exactement la même version.
-  // Si le CID diffère, le record a réellement été modifié et doit être traité.
   return typeof legacy.certificationCid === 'string' && legacy.certificationCid === record.cid
 }
 
@@ -158,6 +150,7 @@ async function writeMarker(record, mode, postUri = '') {
       $type: MARKER_COLLECTION,
       certificationUri: record.uri,
       certificationCid: record.cid,
+      certificationStatus: record.status,
       subjectDid: record.subjectDid,
       subjectHandle: record.subjectHandle,
       issuerDid: record.issuerDid,
@@ -188,7 +181,7 @@ function mentionFacet(text, mention, did, fromIndex = 0) {
   }
 }
 
-function buildAnnouncement(record, verifier) {
+function buildCertificationAnnouncement(record, verifier) {
   const subjectMention = `@${record.subjectHandle}`
   const verifierMention = `@${verifier.handle}`
 
@@ -200,16 +193,33 @@ function buildAnnouncement(record, verifier) {
     `Certification attribuée par ${verifierMention}, certificateur de confiance Kelo Social.`,
   ].join('\n')
 
-  const subjectFacet = mentionFacet(text, subjectMention, record.subjectDid)
-  const verifierFacet = mentionFacet(text, verifierMention, verifier.did)
-  const facets = [subjectFacet, verifierFacet].filter(Boolean)
+  const facets = [
+    mentionFacet(text, subjectMention, record.subjectDid),
+    mentionFacet(text, verifierMention, verifier.did),
+  ].filter(Boolean)
 
   return { text, facets }
 }
 
-async function publishAnnouncement(record, verifier) {
-  const { text, facets } = buildAnnouncement(record, verifier)
+function buildTrustedVerifierAnnouncement(record) {
+  const subjectMention = `@${record.subjectHandle}`
 
+  const text = [
+    '🌟 Nouveau certificateur de confiance',
+    '',
+    `${subjectMention} rejoint les certificateurs de confiance de Kelo Social.`,
+    '',
+    'Ce compte peut désormais attribuer des certifications aux comptes éligibles sur Kelo Social.',
+  ].join('\n')
+
+  const facets = [
+    mentionFacet(text, subjectMention, record.subjectDid),
+  ].filter(Boolean)
+
+  return { text, facets }
+}
+
+async function publishPost(text, facets) {
   const response = await bot.post({
     text,
     facets,
@@ -221,19 +231,26 @@ async function publishAnnouncement(record, verifier) {
   return response.uri
 }
 
+async function publishCertificationAnnouncement(record, verifier) {
+  const { text, facets } = buildCertificationAnnouncement(record, verifier)
+  return publishPost(text, facets)
+}
+
+async function publishTrustedVerifierAnnouncement(record) {
+  const { text, facets } = buildTrustedVerifierAnnouncement(record)
+  return publishPost(text, facets)
+}
+
 async function initializePersistentBaseline(records) {
-  const certified = records.filter((record) => record.status === 'certified')
   let created = 0
   let existing = 0
 
-  for (const record of certified) {
+  for (const record of records) {
     if (await recordAlreadyHandled(record)) {
       existing += 1
       continue
     }
 
-    // Les records déjà présents lors du premier démarrage après migration sont
-    // marqués comme historique afin de ne pas republier tout l'ancien registre.
     await writeMarker(record, 'baseline')
     created += 1
   }
@@ -242,13 +259,44 @@ async function initializePersistentBaseline(records) {
   console.log(`[baseline] prêt : ${created} marqueur(s) créé(s), ${existing} déjà présent(s)`)
 }
 
-async function processCertifiedRecords(records) {
-  const certifiedRecords = records
-    .filter((record) => record.status === 'certified')
-    .sort((a, b) => Date.parse(a.issuedAt) - Date.parse(b.issuedAt))
+async function processRecords(records) {
+  const orderedRecords = [...records].sort(
+    (a, b) => Date.parse(a.issuedAt) - Date.parse(b.issuedAt),
+  )
 
-  for (const record of certifiedRecords) {
+  for (const record of orderedRecords) {
     if (await recordAlreadyHandled(record)) continue
+
+    if (record.status === 'trusted-verifier') {
+      console.log(`[detect] nouveau certificateur de confiance @${record.subjectHandle}`)
+
+      try {
+        const postUri = await publishTrustedVerifierAnnouncement(record)
+        await writeMarker(record, 'posted-trusted-verifier', postUri)
+
+        lastDetectedCertification = {
+          type: 'trusted-verifier',
+          subjectHandle: record.subjectHandle,
+          recordUri: record.uri,
+          recordCid: record.cid,
+          postUri,
+          detectedAt: new Date().toISOString(),
+        }
+        lastDecision = { action: 'posted-trusted-verifier', ...lastDetectedCertification }
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error)
+        lastDecision = {
+          action: 'error-trusted-verifier',
+          subjectHandle: record.subjectHandle,
+          recordCid: record.cid,
+          error: lastError,
+          at: new Date().toISOString(),
+        }
+        console.error(`[post] échec annonce certificateur @${record.subjectHandle}:`, error?.message || error)
+      }
+
+      continue
+    }
 
     const verifier = trustedVerifiers.get(record.issuerDid)
 
@@ -273,10 +321,11 @@ async function processCertifiedRecords(records) {
     )
 
     try {
-      const postUri = await publishAnnouncement(record, verifier)
-      await writeMarker(record, 'posted', postUri)
+      const postUri = await publishCertificationAnnouncement(record, verifier)
+      await writeMarker(record, 'posted-certification', postUri)
 
       lastDetectedCertification = {
+        type: 'certified',
         subjectHandle: record.subjectHandle,
         issuerHandle: verifier.handle,
         recordUri: record.uri,
@@ -284,11 +333,11 @@ async function processCertifiedRecords(records) {
         postUri,
         detectedAt: new Date().toISOString(),
       }
-      lastDecision = { action: 'posted', ...lastDetectedCertification }
+      lastDecision = { action: 'posted-certification', ...lastDetectedCertification }
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error)
       lastDecision = {
-        action: 'error',
+        action: 'error-certification',
         subjectHandle: record.subjectHandle,
         issuerHandle: verifier.handle,
         recordCid: record.cid,
@@ -312,7 +361,7 @@ async function poll() {
     if (!baselineReady) {
       await initializePersistentBaseline(records)
     } else {
-      await processCertifiedRecords(records)
+      await processRecords(records)
     }
 
     lastSuccessfulPollAt = new Date().toISOString()
