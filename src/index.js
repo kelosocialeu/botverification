@@ -11,7 +11,7 @@ const BOT_SERVICE = process.env.BOT_SERVICE || 'https://eurosky.social'
 const BOT_IDENTIFIER = process.env.BOT_IDENTIFIER
 const BOT_PASSWORD = process.env.BOT_PASSWORD
 const PORT = Number(process.env.PORT || 3000)
-const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 60_000)
+const POLL_INTERVAL_MS = Math.max(Number(process.env.POLL_INTERVAL_MS || 900_000), 60_000)
 
 if (!BOT_IDENTIFIER || !BOT_PASSWORD) {
   throw new Error('BOT_IDENTIFIER et BOT_PASSWORD sont obligatoires.')
@@ -22,11 +22,15 @@ const registryAgent = new AtpAgent({ service: CERTIFICATION_PDS })
 
 let botDid = null
 let trustedVerifiers = new Map()
+let handledRecordKeys = new Set()
+let announcedSubjectKeys = new Set()
 let pollRunning = false
 let baselineReady = false
+let markerCacheReady = false
 let lastSuccessfulPollAt = null
 let lastError = null
 let lastRegistryCount = 0
+let lastMarkerCount = 0
 let lastDetectedCertification = null
 let lastDecision = null
 
@@ -35,9 +39,11 @@ function normalizeDid(value) {
 }
 
 function normalizeHandle(value) {
-  return typeof value === 'string'
-    ? value.trim().replace(/^@/, '').toLowerCase()
-    : ''
+  return typeof value === 'string' ? value.trim().replace(/^@/, '').toLowerCase() : ''
+}
+
+function hash(value) {
+  return crypto.createHash('sha256').update(value).digest('hex')
 }
 
 function parseCertificationRecord(item) {
@@ -65,28 +71,48 @@ function parseCertificationRecord(item) {
   }
 }
 
-async function listAllCertificationRecords() {
+function recordKey(record) {
+  return `${record.uri}|${record.cid || record.issuedAt}`
+}
+
+function legacyRecordKey(record) {
+  return `${record.uri}|${record.issuedAt}`
+}
+
+function subjectAnnouncementKey(record) {
+  return `${record.status}|${record.subjectDid}`
+}
+
+function markerRkey(record) {
+  return hash(recordKey(record))
+}
+
+async function listAllRecords(agent, repo, collection) {
   const records = []
   let cursor
 
   do {
-    const response = await registryAgent.com.atproto.repo.listRecords({
-      repo: CERTIFICATION_REPO,
-      collection: COLLECTION,
+    const response = await agent.com.atproto.repo.listRecords({
+      repo,
+      collection,
       limit: 100,
       cursor,
     })
-
     records.push(...(response.data.records || []))
     cursor = response.data.cursor
   } while (cursor)
 
-  return records.map(parseCertificationRecord).filter(Boolean)
+  return records
+}
+
+async function listAllCertificationRecords() {
+  return (await listAllRecords(registryAgent, CERTIFICATION_REPO, COLLECTION))
+    .map(parseCertificationRecord)
+    .filter(Boolean)
 }
 
 function rebuildTrustedVerifierRegistry(records) {
   const next = new Map()
-
   for (const record of records) {
     if (record.status !== 'trusted-verifier') continue
     next.set(record.subjectDid, {
@@ -95,47 +121,50 @@ function rebuildTrustedVerifierRegistry(records) {
       issuedAt: record.issuedAt,
     })
   }
-
   trustedVerifiers = next
   console.log(`[registry] ${trustedVerifiers.size} certificateur(s) de confiance détecté(s)`)
 }
 
-function legacyMarkerRkey(record) {
-  return crypto
-    .createHash('sha256')
-    .update(`${record.uri}|${record.issuedAt}`)
-    .digest('hex')
-}
+async function loadMarkerCache() {
+  handledRecordKeys = new Set()
+  announcedSubjectKeys = new Set()
 
-function markerRkey(record) {
-  return crypto
-    .createHash('sha256')
-    .update(`${record.uri}|${record.cid || record.issuedAt}`)
-    .digest('hex')
-}
+  const markers = await listAllRecords(bot, botDid, MARKER_COLLECTION)
+  lastMarkerCount = markers.length
 
-async function getMarkerByRkey(rkey) {
-  if (!botDid) return null
+  for (const item of markers) {
+    const value = item?.value
+    if (!value || typeof value !== 'object') continue
 
-  try {
-    const response = await bot.com.atproto.repo.getRecord({
-      repo: botDid,
-      collection: MARKER_COLLECTION,
-      rkey,
-    })
-    return response.data.value || null
-  } catch {
-    return null
+    const certificationUri = typeof value.certificationUri === 'string' ? value.certificationUri : ''
+    const certificationCid = typeof value.certificationCid === 'string' ? value.certificationCid : ''
+    const issuedAt = typeof value.issuedAt === 'string' ? value.issuedAt : ''
+    const status = value.certificationStatus
+    const subjectDid = normalizeDid(value.subjectDid)
+    const mode = typeof value.mode === 'string' ? value.mode : ''
+
+    if (certificationUri && certificationCid) {
+      handledRecordKeys.add(`${certificationUri}|${certificationCid}`)
+    }
+    if (certificationUri && issuedAt) {
+      handledRecordKeys.add(`${certificationUri}|${issuedAt}`)
+    }
+
+    if (
+      subjectDid &&
+      (status === 'certified' || status === 'trusted-verifier') &&
+      (mode.startsWith('posted-') || mode === 'announcement-claimed')
+    ) {
+      announcedSubjectKeys.add(`${status}|${subjectDid}`)
+    }
   }
+
+  markerCacheReady = true
+  console.log(`[markers] cache chargé : ${markers.length} marqueur(s), ${announcedSubjectKeys.size} compte(s) déjà annoncé(s)`)
 }
 
-async function recordAlreadyHandled(record) {
-  if (await getMarkerByRkey(markerRkey(record))) return true
-
-  const legacy = await getMarkerByRkey(legacyMarkerRkey(record))
-  if (!legacy) return false
-
-  return typeof legacy.certificationCid === 'string' && legacy.certificationCid === record.cid
+function recordAlreadyHandled(record) {
+  return handledRecordKeys.has(recordKey(record)) || handledRecordKeys.has(legacyRecordKey(record))
 }
 
 async function writeMarker(record, mode, postUri = '') {
@@ -161,30 +190,38 @@ async function writeMarker(record, mode, postUri = '') {
       recordedAt: new Date().toISOString(),
     },
   })
+
+  handledRecordKeys.add(recordKey(record))
+  handledRecordKeys.add(legacyRecordKey(record))
+  lastMarkerCount += 1
 }
 
-function mentionFacet(text, mention, did, fromIndex = 0) {
-  const start = text.indexOf(mention, fromIndex)
-  if (start < 0 || !did) return null
+async function claimAnnouncement(record) {
+  const key = subjectAnnouncementKey(record)
+  if (announcedSubjectKeys.has(key)) return false
 
+  // Le verrou est écrit AVANT le post : après un redémarrage, le même compte
+  // ne pourra pas être annoncé une seconde fois, même avec un nouveau CID.
+  await writeMarker(record, 'announcement-claimed')
+  announcedSubjectKeys.add(key)
+  return true
+}
+
+function mentionFacet(text, mention, did) {
+  const start = text.indexOf(mention)
+  if (start < 0 || !did) return null
   return {
     index: {
       byteStart: Buffer.byteLength(text.slice(0, start), 'utf8'),
       byteEnd: Buffer.byteLength(text.slice(0, start + mention.length), 'utf8'),
     },
-    features: [
-      {
-        $type: 'app.bsky.richtext.facet#mention',
-        did,
-      },
-    ],
+    features: [{ $type: 'app.bsky.richtext.facet#mention', did }],
   }
 }
 
 function buildCertificationAnnouncement(record, verifier) {
   const subjectMention = `@${record.subjectHandle}`
   const verifierMention = `@${verifier.handle}`
-
   const text = [
     '✅ Certification accordée',
     '',
@@ -193,17 +230,17 @@ function buildCertificationAnnouncement(record, verifier) {
     `Certification attribuée par ${verifierMention}, certificateur de confiance Kelo Social.`,
   ].join('\n')
 
-  const facets = [
-    mentionFacet(text, subjectMention, record.subjectDid),
-    mentionFacet(text, verifierMention, verifier.did),
-  ].filter(Boolean)
-
-  return { text, facets }
+  return {
+    text,
+    facets: [
+      mentionFacet(text, subjectMention, record.subjectDid),
+      mentionFacet(text, verifierMention, verifier.did),
+    ].filter(Boolean),
+  }
 }
 
 function buildTrustedVerifierAnnouncement(record) {
   const subjectMention = `@${record.subjectHandle}`
-
   const text = [
     '🌟 Nouveau certificateur de confiance',
     '',
@@ -212,11 +249,10 @@ function buildTrustedVerifierAnnouncement(record) {
     'Ce compte peut désormais attribuer des certifications aux comptes éligibles sur Kelo Social.',
   ].join('\n')
 
-  const facets = [
-    mentionFacet(text, subjectMention, record.subjectDid),
-  ].filter(Boolean)
-
-  return { text, facets }
+  return {
+    text,
+    facets: [mentionFacet(text, subjectMention, record.subjectDid)].filter(Boolean),
+  }
 }
 
 async function publishPost(text, facets) {
@@ -226,19 +262,8 @@ async function publishPost(text, facets) {
     createdAt: new Date().toISOString(),
     langs: ['fr'],
   })
-
   console.log(`[post] annonce publiée: ${response.uri}`)
   return response.uri
-}
-
-async function publishCertificationAnnouncement(record, verifier) {
-  const { text, facets } = buildCertificationAnnouncement(record, verifier)
-  return publishPost(text, facets)
-}
-
-async function publishTrustedVerifierAnnouncement(record) {
-  const { text, facets } = buildTrustedVerifierAnnouncement(record)
-  return publishPost(text, facets)
 }
 
 async function initializePersistentBaseline(records) {
@@ -246,106 +271,98 @@ async function initializePersistentBaseline(records) {
   let existing = 0
 
   for (const record of records) {
-    if (await recordAlreadyHandled(record)) {
+    if (recordAlreadyHandled(record)) {
       existing += 1
       continue
     }
-
     await writeMarker(record, 'baseline')
     created += 1
   }
 
   baselineReady = true
-  console.log(`[baseline] prêt : ${created} marqueur(s) créé(s), ${existing} déjà présent(s)`)
+  console.log(`[baseline] prêt : ${created} nouveau(x) marqueur(s), ${existing} déjà connu(s)`)
+}
+
+async function suppressDuplicate(record) {
+  await writeMarker(record, 'duplicate-suppressed')
+  lastDecision = {
+    action: 'duplicate-suppressed',
+    subjectHandle: record.subjectHandle,
+    status: record.status,
+    at: new Date().toISOString(),
+  }
+  console.log(`[duplicate] @${record.subjectHandle} déjà annoncé, aucune republication`)
+}
+
+async function processTrustedVerifier(record) {
+  if (announcedSubjectKeys.has(subjectAnnouncementKey(record))) {
+    return suppressDuplicate(record)
+  }
+
+  try {
+    if (!(await claimAnnouncement(record))) return suppressDuplicate(record)
+    const { text, facets } = buildTrustedVerifierAnnouncement(record)
+    const postUri = await publishPost(text, facets)
+
+    lastDetectedCertification = {
+      type: 'trusted-verifier',
+      subjectHandle: record.subjectHandle,
+      postUri,
+      detectedAt: new Date().toISOString(),
+    }
+    lastDecision = { action: 'posted-trusted-verifier', ...lastDetectedCertification }
+  } catch (error) {
+    lastError = error instanceof Error ? error.message : String(error)
+    lastDecision = { action: 'error-trusted-verifier', subjectHandle: record.subjectHandle, error: lastError }
+    console.error(`[post] échec annonce certificateur @${record.subjectHandle}:`, lastError)
+  }
+}
+
+async function processCertification(record) {
+  const verifier = trustedVerifiers.get(record.issuerDid)
+  if (!verifier) {
+    await writeMarker(record, 'ignored-untrusted-issuer')
+    lastDecision = {
+      action: 'ignored',
+      reason: 'issuer-not-trusted-verifier',
+      subjectHandle: record.subjectHandle,
+      issuerDid: record.issuerDid,
+      at: new Date().toISOString(),
+    }
+    return
+  }
+
+  if (announcedSubjectKeys.has(subjectAnnouncementKey(record))) {
+    return suppressDuplicate(record)
+  }
+
+  try {
+    if (!(await claimAnnouncement(record))) return suppressDuplicate(record)
+    const { text, facets } = buildCertificationAnnouncement(record, verifier)
+    const postUri = await publishPost(text, facets)
+
+    lastDetectedCertification = {
+      type: 'certified',
+      subjectHandle: record.subjectHandle,
+      issuerHandle: verifier.handle,
+      postUri,
+      detectedAt: new Date().toISOString(),
+    }
+    lastDecision = { action: 'posted-certification', ...lastDetectedCertification }
+  } catch (error) {
+    lastError = error instanceof Error ? error.message : String(error)
+    lastDecision = { action: 'error-certification', subjectHandle: record.subjectHandle, error: lastError }
+    console.error(`[post] échec pour @${record.subjectHandle}:`, lastError)
+  }
 }
 
 async function processRecords(records) {
-  const orderedRecords = [...records].sort(
-    (a, b) => Date.parse(a.issuedAt) - Date.parse(b.issuedAt),
-  )
+  const orderedRecords = [...records].sort((a, b) => Date.parse(a.issuedAt) - Date.parse(b.issuedAt))
 
   for (const record of orderedRecords) {
-    if (await recordAlreadyHandled(record)) continue
-
-    if (record.status === 'trusted-verifier') {
-      console.log(`[detect] nouveau certificateur de confiance @${record.subjectHandle}`)
-
-      try {
-        const postUri = await publishTrustedVerifierAnnouncement(record)
-        await writeMarker(record, 'posted-trusted-verifier', postUri)
-
-        lastDetectedCertification = {
-          type: 'trusted-verifier',
-          subjectHandle: record.subjectHandle,
-          recordUri: record.uri,
-          recordCid: record.cid,
-          postUri,
-          detectedAt: new Date().toISOString(),
-        }
-        lastDecision = { action: 'posted-trusted-verifier', ...lastDetectedCertification }
-      } catch (error) {
-        lastError = error instanceof Error ? error.message : String(error)
-        lastDecision = {
-          action: 'error-trusted-verifier',
-          subjectHandle: record.subjectHandle,
-          recordCid: record.cid,
-          error: lastError,
-          at: new Date().toISOString(),
-        }
-        console.error(`[post] échec annonce certificateur @${record.subjectHandle}:`, error?.message || error)
-      }
-
-      continue
-    }
-
-    const verifier = trustedVerifiers.get(record.issuerDid)
-
-    if (!verifier) {
-      lastDecision = {
-        action: 'ignored',
-        reason: 'issuer-not-trusted-verifier',
-        subjectHandle: record.subjectHandle,
-        issuerDid: record.issuerDid,
-        issuerHandle: record.issuerHandle,
-        recordCid: record.cid,
-        at: new Date().toISOString(),
-      }
-      console.log(
-        `[ignore] @${record.subjectHandle}: ${record.issuerDid || record.issuerHandle || 'émetteur inconnu'} n'est pas un certificateur de confiance`,
-      )
-      continue
-    }
-
-    console.log(
-      `[detect] @${verifier.handle} a certifié @${record.subjectHandle} (CID ${record.cid})`,
-    )
-
-    try {
-      const postUri = await publishCertificationAnnouncement(record, verifier)
-      await writeMarker(record, 'posted-certification', postUri)
-
-      lastDetectedCertification = {
-        type: 'certified',
-        subjectHandle: record.subjectHandle,
-        issuerHandle: verifier.handle,
-        recordUri: record.uri,
-        recordCid: record.cid,
-        postUri,
-        detectedAt: new Date().toISOString(),
-      }
-      lastDecision = { action: 'posted-certification', ...lastDetectedCertification }
-    } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error)
-      lastDecision = {
-        action: 'error-certification',
-        subjectHandle: record.subjectHandle,
-        issuerHandle: verifier.handle,
-        recordCid: record.cid,
-        error: lastError,
-        at: new Date().toISOString(),
-      }
-      console.error(`[post] échec pour @${record.subjectHandle}:`, error?.message || error)
-    }
+    if (recordAlreadyHandled(record)) continue
+    if (record.status === 'trusted-verifier') await processTrustedVerifier(record)
+    else await processCertification(record)
   }
 }
 
@@ -358,16 +375,14 @@ async function poll() {
     lastRegistryCount = records.length
     rebuildTrustedVerifierRegistry(records)
 
-    if (!baselineReady) {
-      await initializePersistentBaseline(records)
-    } else {
-      await processRecords(records)
-    }
+    if (!baselineReady) await initializePersistentBaseline(records)
+    else await processRecords(records)
 
     lastSuccessfulPollAt = new Date().toISOString()
+    lastError = null
   } catch (error) {
     lastError = error instanceof Error ? error.message : String(error)
-    console.error('[poll] erreur:', error)
+    console.error('[poll] erreur:', lastError)
   } finally {
     pollRunning = false
   }
@@ -376,17 +391,19 @@ async function poll() {
 async function start() {
   await bot.login({ identifier: BOT_IDENTIFIER, password: BOT_PASSWORD })
   botDid = bot.session?.did || null
+  if (!botDid) throw new Error('Impossible de récupérer le DID du bot.')
 
-  console.log(`[bot] connecté: ${BOT_IDENTIFIER}${botDid ? ` (${botDid})` : ''}`)
+  console.log(`[bot] connecté: ${BOT_IDENTIFIER} (${botDid})`)
   console.log(`[registry] ${CERTIFICATION_REPO} / ${COLLECTION} via ${CERTIFICATION_PDS}`)
-  console.log(`[markers] ${MARKER_COLLECTION} sur le dépôt du bot`)
+  console.log(`[poll] intervalle: ${POLL_INTERVAL_MS} ms`)
 
+  await loadMarkerCache()
   await poll()
 
   setInterval(() => {
     poll().catch((error) => {
       lastError = error instanceof Error ? error.message : String(error)
-      console.error('[poll] erreur non gérée:', error)
+      console.error('[poll] erreur non gérée:', lastError)
     })
   }, POLL_INTERVAL_MS)
 }
@@ -406,10 +423,12 @@ app.get('/', (_req, res) => {
       recordCount: lastRegistryCount,
     },
     markerCollection: MARKER_COLLECTION,
-    markerVersion: 'uri+cid',
+    markerVersion: 'memory-cache+subject-lock-v2',
+    markerCacheReady,
+    markerCount: lastMarkerCount,
     baselineReady,
+    announcedSubjectCount: announcedSubjectKeys.size,
     trustedVerifierCount: trustedVerifiers.size,
-    trustedVerifiers: [...trustedVerifiers.values()],
     pollIntervalMs: POLL_INTERVAL_MS,
     pollRunning,
     lastDetectedCertification,
@@ -422,11 +441,12 @@ app.get('/', (_req, res) => {
 app.get('/health', (_req, res) => {
   res.status(lastError ? 503 : 200).json({
     ok: !lastError,
+    markerCacheReady,
     baselineReady,
-    markerVersion: 'uri+cid',
+    markerVersion: 'memory-cache+subject-lock-v2',
+    announcedSubjectCount: announcedSubjectKeys.size,
     trustedVerifierCount: trustedVerifiers.size,
-    lastDetectedCertification,
-    lastDecision,
+    pollIntervalMs: POLL_INTERVAL_MS,
     lastSuccessfulPollAt,
     lastError,
   })
@@ -438,6 +458,6 @@ app.listen(PORT, '0.0.0.0', () => {
 
 start().catch((error) => {
   lastError = error instanceof Error ? error.message : String(error)
-  console.error('[startup] échec du démarrage:', error)
+  console.error('[startup] échec du démarrage:', lastError)
   process.exitCode = 1
 })
