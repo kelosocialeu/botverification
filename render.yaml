@@ -22,6 +22,4 @@ services:
       - key: PUBLIC_APPVIEW
         value: https://public.api.bsky.app
       - key: POLL_INTERVAL_MS
-        value: 60000
-      - key: STARTUP_GRACE_MS
-        value: 300000
+        value: 900000
