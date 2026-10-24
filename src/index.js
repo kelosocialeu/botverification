@@ -6,7 +6,15 @@ import { AtpAgent } from '@atproto/api'
 const COLLECTION = 'eu.kelosocial.certification'
 const MARKER_COLLECTION = 'eu.kelosocial.botverification.seen'
 const CERTIFICATION_REPO = process.env.CERTIFICATION_REPO || 'kelosocial.eu'
-const CERTIFICATION_PDS = process.env.CERTIFICATION_PDS || 'https://eurosky.social'
+const CERTIFICATION_PDS = process.env.CERTIFICATION_PDS || 'https://pds.kelosocial.eu'
+const CERTIFICATION_PDS_CANDIDATES = [...new Set([
+  CERTIFICATION_PDS,
+  ...(process.env.CERTIFICATION_PDS_FALLBACKS || 'https://pds.kelosocial.eu,https://eurosky.social')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean),
+])]
+let activeCertificationPds = CERTIFICATION_PDS
 const BOT_SERVICE = process.env.BOT_SERVICE || 'https://eurosky.social'
 const BOT_IDENTIFIER = process.env.BOT_IDENTIFIER
 const BOT_PASSWORD = process.env.BOT_PASSWORD
@@ -19,7 +27,6 @@ if (!BOT_IDENTIFIER || !BOT_PASSWORD) {
 }
 
 const bot = new AtpAgent({ service: BOT_SERVICE })
-const registryAgent = new AtpAgent({ service: CERTIFICATION_PDS })
 
 let botDid = null
 let trustedVerifiers = new Map()
@@ -119,14 +126,38 @@ async function listAllRecords(agent, repo, collection) {
 }
 
 async function listAllCertificationRecords() {
-  const rawRecords = await listAllRecords(registryAgent, CERTIFICATION_REPO, COLLECTION)
-  lastRawRegistryCount = rawRecords.length
-  const parsedRecords = rawRecords.map(parseCertificationRecord).filter(Boolean)
-  console.log(`[registry] ${rawRecords.length} record(s) brut(s), ${parsedRecords.length} certification(s) reconnue(s)`)
-  if (rawRecords.length > 0 && parsedRecords.length === 0) {
-    console.warn(`[registry] aucun record ne correspond au schéma attendu (${COLLECTION}, subjectDid, subjectHandle, issuedAt, status)`)
+  let lastEmptyResult = []
+  let lastFailure = null
+
+  // Le compte du registre peut être hébergé sur un PDS différent de celui du bot.
+  // On essaie le PDS configuré puis les replis, et on privilégie le premier qui contient des records.
+  for (const pds of CERTIFICATION_PDS_CANDIDATES) {
+    try {
+      const agent = new AtpAgent({ service: pds })
+      const rawRecords = await listAllRecords(agent, CERTIFICATION_REPO, COLLECTION)
+      if (rawRecords.length > 0) {
+        activeCertificationPds = pds
+        lastRawRegistryCount = rawRecords.length
+        const parsedRecords = rawRecords.map(parseCertificationRecord).filter(Boolean)
+        console.log(`[registry] lecture réussie via ${pds}: ${rawRecords.length} record(s) brut(s), ${parsedRecords.length} certification(s) reconnue(s)`)
+        if (parsedRecords.length === 0) {
+          console.warn(`[registry] aucun record ne correspond au schéma reconnu dans ${COLLECTION}; champs attendus: sujet, statut et date`)
+        }
+        return parsedRecords
+      }
+      lastEmptyResult = rawRecords
+      activeCertificationPds = pds
+      console.log(`[registry] aucun record via ${pds}; essai du PDS suivant si disponible`)
+    } catch (error) {
+      lastFailure = error
+      console.warn(`[registry] lecture impossible via ${pds}: ${error instanceof Error ? error.message : String(error)}`)
+    }
   }
-  return parsedRecords
+
+  if (lastFailure && lastEmptyResult.length === 0) throw lastFailure
+  lastRawRegistryCount = lastEmptyResult.length
+  console.log(`[registry] aucun record trouvé sur les PDS testés: ${CERTIFICATION_PDS_CANDIDATES.join(', ')}`)
+  return []
 }
 
 function rebuildTrustedVerifierRegistry(records) {
@@ -486,7 +517,7 @@ async function start() {
   if (!botDid) throw new Error('Impossible de récupérer le DID du bot.')
 
   console.log(`[bot] connecté: ${BOT_IDENTIFIER} (${botDid})`)
-  console.log(`[registry] ${CERTIFICATION_REPO} / ${COLLECTION} via ${CERTIFICATION_PDS}`)
+  console.log(`[registry] ${CERTIFICATION_REPO} / ${COLLECTION}; PDS testés: ${CERTIFICATION_PDS_CANDIDATES.join(', ')}`)
   console.log(`[poll] intervalle: ${POLL_INTERVAL_MS} ms (détection quasi immédiate)`)
 
   await loadMarkerCache()
@@ -514,7 +545,8 @@ app.get('/', (_req, res) => {
     botDid,
     registry: {
       repo: CERTIFICATION_REPO,
-      pds: CERTIFICATION_PDS,
+      pds: activeCertificationPds,
+      pdsCandidates: CERTIFICATION_PDS_CANDIDATES,
       collection: COLLECTION,
       recordCount: lastRegistryCount,
       rawRecordCount: lastRawRegistryCount,
