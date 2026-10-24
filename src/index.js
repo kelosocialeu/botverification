@@ -6,12 +6,12 @@ import { AtpAgent } from '@atproto/api'
 const COLLECTION = 'eu.kelosocial.certification'
 const MARKER_COLLECTION = 'eu.kelosocial.botverification.seen'
 const CERTIFICATION_REPO = process.env.CERTIFICATION_REPO || 'kelosocial.eu'
-const CERTIFICATION_PDS = process.env.CERTIFICATION_PDS || 'https://eurosky.social'
+const CERTIFICATION_PDS = process.env.CERTIFICATION_PDS || 'https://pds.kelosocial.eu'
 const BOT_SERVICE = process.env.BOT_SERVICE || 'https://eurosky.social'
 const BOT_IDENTIFIER = process.env.BOT_IDENTIFIER
 const BOT_PASSWORD = process.env.BOT_PASSWORD
 const PORT = Number(process.env.PORT || 3000)
-const POLL_INTERVAL_MS = Math.max(Number(process.env.POLL_INTERVAL_MS || 900_000), 60_000)
+const POLL_INTERVAL_MS = Math.max(Number(process.env.POLL_INTERVAL_MS || 10_000), 10_000)
 
 if (!BOT_IDENTIFIER || !BOT_PASSWORD) {
   throw new Error('BOT_IDENTIFIER et BOT_PASSWORD sont obligatoires.')
@@ -131,6 +131,9 @@ async function loadMarkerCache() {
 
   const markers = await listAllRecords(bot, botDid, MARKER_COLLECTION)
   lastMarkerCount = markers.length
+  // Un cache persistant existant signifie que le bot a déjà effectué son premier scan.
+  // Ne jamais reclasser les records apparus pendant un arrêt comme faisant partie de la baseline.
+  baselineReady = markers.length > 0 || markers.some((item) => item?.value?.mode === 'baseline-initialized')
 
   for (const item of markers) {
     const value = item?.value
@@ -279,6 +282,19 @@ async function initializePersistentBaseline(records) {
     created += 1
   }
 
+  // Marqueur de bootstrap séparé : même un registre vide ne doit être initialisé
+  // qu'une seule fois. Les records ajoutés ensuite seront donc publiés après détection.
+  await bot.com.atproto.repo.putRecord({
+    repo: botDid,
+    collection: MARKER_COLLECTION,
+    rkey: 'baseline-v1',
+    validate: false,
+    record: {
+      $type: MARKER_COLLECTION,
+      mode: 'baseline-initialized',
+      recordedAt: new Date().toISOString(),
+    },
+  })
   baselineReady = true
   console.log(`[baseline] prêt : ${created} nouveau(x) marqueur(s), ${existing} déjà connu(s)`)
 }
@@ -395,7 +411,7 @@ async function start() {
 
   console.log(`[bot] connecté: ${BOT_IDENTIFIER} (${botDid})`)
   console.log(`[registry] ${CERTIFICATION_REPO} / ${COLLECTION} via ${CERTIFICATION_PDS}`)
-  console.log(`[poll] intervalle: ${POLL_INTERVAL_MS} ms`)
+  console.log(`[poll] intervalle: ${POLL_INTERVAL_MS} ms (détection quasi immédiate)`)
 
   await loadMarkerCache()
   await poll()
@@ -423,7 +439,7 @@ app.get('/', (_req, res) => {
       recordCount: lastRegistryCount,
     },
     markerCollection: MARKER_COLLECTION,
-    markerVersion: 'memory-cache+subject-lock-v2',
+    markerVersion: 'persistent-baseline+subject-lock-v3',
     markerCacheReady,
     markerCount: lastMarkerCount,
     baselineReady,
@@ -443,7 +459,7 @@ app.get('/health', (_req, res) => {
     ok: !lastError,
     markerCacheReady,
     baselineReady,
-    markerVersion: 'memory-cache+subject-lock-v2',
+    markerVersion: 'persistent-baseline+subject-lock-v3',
     announcedSubjectCount: announcedSubjectKeys.size,
     trustedVerifierCount: trustedVerifiers.size,
     pollIntervalMs: POLL_INTERVAL_MS,
