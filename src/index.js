@@ -11,7 +11,8 @@ const BOT_SERVICE = process.env.BOT_SERVICE || 'https://eurosky.social'
 const BOT_IDENTIFIER = process.env.BOT_IDENTIFIER
 const BOT_PASSWORD = process.env.BOT_PASSWORD
 const PORT = Number(process.env.PORT || 3000)
-const POLL_INTERVAL_MS = Math.max(Number(process.env.POLL_INTERVAL_MS || 10_000), 10_000)
+const POLL_INTERVAL_MS = Math.max(Number(process.env.POLL_INTERVAL_MS || 10_000), 2_000)
+const JETSTREAM_URL = process.env.JETSTREAM_URL || 'wss://jetstream.us-east.bsky.network/subscribe'
 
 if (!BOT_IDENTIFIER || !BOT_PASSWORD) {
   throw new Error('BOT_IDENTIFIER et BOT_PASSWORD sont obligatoires.')
@@ -25,6 +26,9 @@ let trustedVerifiers = new Map()
 let handledRecordKeys = new Set()
 let announcedSubjectKeys = new Set()
 let pollRunning = false
+let pollRequested = false
+let jetstreamSocket = null
+let jetstreamReconnectTimer = null
 let baselineReady = false
 let markerCacheReady = false
 let lastSuccessfulPollAt = null
@@ -51,19 +55,27 @@ function parseCertificationRecord(item) {
   if (!item?.uri || !item?.value || typeof item.value !== 'object') return null
 
   const value = item.value
-  const subjectDid = normalizeDid(value.subjectDid)
-  const subjectHandle = normalizeHandle(value.subjectHandle)
-  const issuerDid = normalizeDid(value.issuerDid)
-  const issuerHandle = normalizeHandle(value.issuerHandle)
-  const issuedAt = typeof value.issuedAt === 'string' ? value.issuedAt : ''
+  // Accepte les variantes de champs déjà utilisées par les versions du registre.
+  const subjectDid = normalizeDid(value.subjectDid || value.did || value.verifierDid || value.accountDid)
+  const subjectHandle = normalizeHandle(value.subjectHandle || value.handle || value.verifierHandle || value.accountHandle)
+  const issuerDid = normalizeDid(value.issuerDid || value.certifierDid || value.issuedByDid)
+  const issuerHandle = normalizeHandle(value.issuerHandle || value.certifierHandle || value.issuedByHandle)
+  const issuedAt = [
+    value.issuedAt, value.createdAt, value.certifiedAt, value.updatedAt, value.timestamp,
+  ].find((candidate) => typeof candidate === 'string' && candidate.length > 0) || ''
+  const rawStatus = String(value.status || value.type || value.kind || '').toLowerCase()
+  const status = ['trusted-verifier', 'trusted_verifier', 'trustedverifier', 'trusted-certifier', 'trusted_certifier'].includes(rawStatus)
+    ? 'trusted-verifier'
+    : ['certified', 'certification', 'verified'].includes(rawStatus)
+      ? 'certified'
+      : ''
 
-  if (!subjectDid || !subjectHandle || !issuedAt) return null
-  if (value.status !== 'certified' && value.status !== 'trusted-verifier') return null
+  if (!subjectDid || !subjectHandle || !issuedAt || !status) return null
 
   return {
     uri: item.uri,
     cid: typeof item.cid === 'string' ? item.cid : '',
-    status: value.status,
+    status,
     subjectDid,
     subjectHandle,
     issuerDid,
@@ -390,7 +402,10 @@ async function processRecords(records) {
 }
 
 async function poll() {
-  if (pollRunning) return
+  if (pollRunning) {
+    pollRequested = true
+    return
+  }
   pollRunning = true
   lastError = null
 
@@ -408,6 +423,60 @@ async function poll() {
     console.error('[poll] erreur:', lastError)
   } finally {
     pollRunning = false
+    if (pollRequested) {
+      pollRequested = false
+      queueMicrotask(() => poll().catch((error) => {
+        lastError = error instanceof Error ? error.message : String(error)
+        console.error('[poll] erreur après demande en attente:', lastError)
+      }))
+    }
+  }
+}
+
+function connectJetstream() {
+  if (jetstreamSocket && (jetstreamSocket.readyState === WebSocket.OPEN || jetstreamSocket.readyState === WebSocket.CONNECTING)) return
+
+  try {
+    const url = new URL(JETSTREAM_URL)
+    url.searchParams.append('wantedCollections', COLLECTION)
+    jetstreamSocket = new WebSocket(url)
+
+    jetstreamSocket.addEventListener('open', () => {
+      console.log(`[jetstream] connecté à ${url.origin}; écoute de ${COLLECTION}`)
+    })
+
+    jetstreamSocket.addEventListener('message', (event) => {
+      try {
+        const data = JSON.parse(String(event.data))
+        if (data?.kind !== 'commit') return
+        if (data?.commit?.operation === 'delete') return
+        if (data?.commit?.collection !== COLLECTION) return
+
+        console.log(`[jetstream] événement ${data.commit.operation || 'commit'} détecté pour ${data.commit.collection}; scan immédiat`)
+        poll().catch((error) => {
+          lastError = error instanceof Error ? error.message : String(error)
+          console.error('[jetstream] scan immédiat échoué:', lastError)
+        })
+      } catch (error) {
+        console.warn('[jetstream] événement illisible:', error instanceof Error ? error.message : String(error))
+      }
+    })
+
+    jetstreamSocket.addEventListener('error', () => {
+      console.error('[jetstream] erreur de connexion; reconnexion programmée')
+      try { jetstreamSocket?.close() } catch {}
+    })
+
+    jetstreamSocket.addEventListener('close', () => {
+      jetstreamSocket = null
+      if (jetstreamReconnectTimer) clearTimeout(jetstreamReconnectTimer)
+      jetstreamReconnectTimer = setTimeout(connectJetstream, 5_000)
+      console.warn('[jetstream] connexion fermée; nouvelle tentative dans 5 secondes')
+    })
+  } catch (error) {
+    lastError = error instanceof Error ? error.message : String(error)
+    console.error('[jetstream] connexion impossible:', lastError)
+    jetstreamReconnectTimer = setTimeout(connectJetstream, 5_000)
   }
 }
 
@@ -422,6 +491,10 @@ async function start() {
 
   await loadMarkerCache()
   await poll()
+
+  // Le flux événementiel publie dès l'arrivée d'un commit; le scan périodique
+  // reste actif comme filet de sécurité en cas d'indisponibilité du flux.
+  connectJetstream()
 
   setInterval(() => {
     poll().catch((error) => {
@@ -454,6 +527,8 @@ app.get('/', (_req, res) => {
     announcedSubjectCount: announcedSubjectKeys.size,
     trustedVerifierCount: trustedVerifiers.size,
     pollIntervalMs: POLL_INTERVAL_MS,
+    jetstreamUrl: JETSTREAM_URL,
+    jetstreamConnected: Boolean(jetstreamSocket && jetstreamSocket.readyState === WebSocket.OPEN),
     pollRunning,
     lastDetectedCertification,
     lastDecision,
@@ -473,6 +548,7 @@ app.get('/health', (_req, res) => {
     announcedSubjectCount: announcedSubjectKeys.size,
     trustedVerifierCount: trustedVerifiers.size,
     pollIntervalMs: POLL_INTERVAL_MS,
+    jetstreamConnected: Boolean(jetstreamSocket && jetstreamSocket.readyState === WebSocket.OPEN),
     lastSuccessfulPollAt,
     lastError,
   })
