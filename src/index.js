@@ -19,7 +19,7 @@ const BOT_SERVICE = process.env.BOT_SERVICE || 'https://eurosky.social'
 const BOT_IDENTIFIER = process.env.BOT_IDENTIFIER
 const BOT_PASSWORD = process.env.BOT_PASSWORD
 const PORT = Number(process.env.PORT || 3000)
-const POLL_INTERVAL_MS = Math.max(Number(process.env.POLL_INTERVAL_MS || 10_000), 2_000)
+const POLL_INTERVAL_MS = Math.max(Number(process.env.POLL_INTERVAL_MS || 2_000), 2_000)
 const JETSTREAM_URL = process.env.JETSTREAM_URL || 'wss://jetstream.us-east.bsky.network/subscribe'
 
 if (!BOT_IDENTIFIER || !BOT_PASSWORD) {
