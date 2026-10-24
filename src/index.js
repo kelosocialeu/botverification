@@ -30,6 +30,7 @@ let markerCacheReady = false
 let lastSuccessfulPollAt = null
 let lastError = null
 let lastRegistryCount = 0
+let lastRawRegistryCount = 0
 let lastMarkerCount = 0
 let lastDetectedCertification = null
 let lastDecision = null
@@ -106,9 +107,14 @@ async function listAllRecords(agent, repo, collection) {
 }
 
 async function listAllCertificationRecords() {
-  return (await listAllRecords(registryAgent, CERTIFICATION_REPO, COLLECTION))
-    .map(parseCertificationRecord)
-    .filter(Boolean)
+  const rawRecords = await listAllRecords(registryAgent, CERTIFICATION_REPO, COLLECTION)
+  lastRawRegistryCount = rawRecords.length
+  const parsedRecords = rawRecords.map(parseCertificationRecord).filter(Boolean)
+  console.log(`[registry] ${rawRecords.length} record(s) brut(s), ${parsedRecords.length} certification(s) reconnue(s)`)
+  if (rawRecords.length > 0 && parsedRecords.length === 0) {
+    console.warn(`[registry] aucun record ne correspond au schéma attendu (${COLLECTION}, subjectDid, subjectHandle, issuedAt, status)`)
+  }
+  return parsedRecords
 }
 
 function rebuildTrustedVerifierRegistry(records) {
@@ -203,10 +209,6 @@ async function claimAnnouncement(record) {
   const key = subjectAnnouncementKey(record)
   if (announcedSubjectKeys.has(key)) return false
 
-  // Le verrou est écrit AVANT le post : après un redémarrage, le même compte
-  // ne pourra pas être annoncé une seconde fois, même avec un nouveau CID.
-  await writeMarker(record, 'announcement-claimed')
-  announcedSubjectKeys.add(key)
   return true
 }
 
@@ -319,6 +321,8 @@ async function processTrustedVerifier(record) {
     if (!(await claimAnnouncement(record))) return suppressDuplicate(record)
     const { text, facets } = buildTrustedVerifierAnnouncement(record)
     const postUri = await publishPost(text, facets)
+    await writeMarker(record, 'posted-trusted-verifier', postUri)
+    announcedSubjectKeys.add(subjectAnnouncementKey(record))
 
     lastDetectedCertification = {
       type: 'trusted-verifier',
@@ -329,6 +333,7 @@ async function processTrustedVerifier(record) {
     lastDecision = { action: 'posted-trusted-verifier', ...lastDetectedCertification }
   } catch (error) {
     lastError = error instanceof Error ? error.message : String(error)
+    announcedSubjectKeys.delete(subjectAnnouncementKey(record))
     lastDecision = { action: 'error-trusted-verifier', subjectHandle: record.subjectHandle, error: lastError }
     console.error(`[post] échec annonce certificateur @${record.subjectHandle}:`, lastError)
   }
@@ -337,7 +342,6 @@ async function processTrustedVerifier(record) {
 async function processCertification(record) {
   const verifier = trustedVerifiers.get(record.issuerDid)
   if (!verifier) {
-    await writeMarker(record, 'ignored-untrusted-issuer')
     lastDecision = {
       action: 'ignored',
       reason: 'issuer-not-trusted-verifier',
@@ -356,6 +360,8 @@ async function processCertification(record) {
     if (!(await claimAnnouncement(record))) return suppressDuplicate(record)
     const { text, facets } = buildCertificationAnnouncement(record, verifier)
     const postUri = await publishPost(text, facets)
+    await writeMarker(record, 'posted-certification', postUri)
+    announcedSubjectKeys.add(subjectAnnouncementKey(record))
 
     lastDetectedCertification = {
       type: 'certified',
@@ -367,6 +373,7 @@ async function processCertification(record) {
     lastDecision = { action: 'posted-certification', ...lastDetectedCertification }
   } catch (error) {
     lastError = error instanceof Error ? error.message : String(error)
+    announcedSubjectKeys.delete(subjectAnnouncementKey(record))
     lastDecision = { action: 'error-certification', subjectHandle: record.subjectHandle, error: lastError }
     console.error(`[post] échec pour @${record.subjectHandle}:`, lastError)
   }
@@ -385,6 +392,7 @@ async function processRecords(records) {
 async function poll() {
   if (pollRunning) return
   pollRunning = true
+  lastError = null
 
   try {
     const records = await listAllCertificationRecords()
@@ -395,7 +403,6 @@ async function poll() {
     else await processRecords(records)
 
     lastSuccessfulPollAt = new Date().toISOString()
-    lastError = null
   } catch (error) {
     lastError = error instanceof Error ? error.message : String(error)
     console.error('[poll] erreur:', lastError)
@@ -437,6 +444,7 @@ app.get('/', (_req, res) => {
       pds: CERTIFICATION_PDS,
       collection: COLLECTION,
       recordCount: lastRegistryCount,
+      rawRecordCount: lastRawRegistryCount,
     },
     markerCollection: MARKER_COLLECTION,
     markerVersion: 'persistent-baseline+subject-lock-v3',
@@ -458,6 +466,8 @@ app.get('/health', (_req, res) => {
   res.status(lastError ? 503 : 200).json({
     ok: !lastError,
     markerCacheReady,
+    rawRecordCount: lastRawRegistryCount,
+    parsedCertificationCount: lastRegistryCount,
     baselineReady,
     markerVersion: 'persistent-baseline+subject-lock-v3',
     announcedSubjectCount: announcedSubjectKeys.size,
