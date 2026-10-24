@@ -2,7 +2,7 @@
 
 Bot officiel destiné à annoncer automatiquement les certifications émises par les certificateurs de confiance de Kelo Social.
 
-Le bot surveille le registre AT Protocol Kelo Social `eu.kelosocial.certification` et publie une annonce dès qu'il détecte une nouvelle certification attribuée par un certificateur de confiance, ou un nouveau certificateur de confiance. Le scan est effectué toutes les 10 secondes par défaut.
+Le bot écoute le flux événementiel Jetstream pour détecter les créations/modifications du registre AT Protocol Kelo Social `eu.kelosocial.certification` et déclenche alors un scan immédiat. Un scan périodique de secours est également effectué toutes les 10 secondes par défaut.
 
 ## Variables d'environnement
 
@@ -13,7 +13,8 @@ Le bot surveille le registre AT Protocol Kelo Social `eu.kelosocial.certificatio
 | `BOT_SERVICE` | URL du PDS du compte bot, par exemple `https://pds.kelosocial.eu` |
 | `TRUSTED_VERIFIERS` | Handles ou DIDs des certificateurs de confiance, séparés par des virgules |
 | `PUBLIC_APPVIEW` | AppView utilisé pour résoudre les handles et profils |
-| `POLL_INTERVAL_MS` | Intervalle entre deux scans, 10000 ms par défaut (minimum 10000) |
+| `POLL_INTERVAL_MS` | Intervalle des scans de secours, 10000 ms par défaut (minimum 2000) |
+| `JETSTREAM_URL` | Flux événementiel AT Protocol, par défaut `wss://jetstream.us-east.bsky.network/subscribe` |
 
 
 Ne jamais mettre le vrai mot de passe dans GitHub. Utiliser les variables secrètes de Render.
@@ -51,4 +52,4 @@ Certification délivrée par un certificateur de confiance.
 - publication automatique avec le compte du bot ;
 - déduplication en mémoire pendant l'exécution.
 
-Le bot vérifie le registre toutes les 10 secondes et publie lors du scan suivant la détection. Cela ne constitue pas un flux instantané événementiel. Pour une disponibilité continue, le service doit rester actif : un Web Service Render gratuit peut s'endormir lorsqu'il ne reçoit pas de trafic entrant.
+Le flux événementiel déclenche un scan à l'arrivée d'un commit correspondant; le scan périodique reste une sécurité en cas de coupure du flux. La publication dépend toutefois de l'accessibilité du registre et des identifiants/permissions du compte bot. Pour une disponibilité continue, le service doit rester actif : un Web Service Render gratuit peut s'endormir lorsqu'il ne reçoit pas de trafic entrant.
