@@ -23,3 +23,5 @@ services:
         value: https://public.api.bsky.app
       - key: POLL_INTERVAL_MS
         value: 10000
+      - key: JETSTREAM_URL
+        value: wss://jetstream.us-east.bsky.network/subscribe
