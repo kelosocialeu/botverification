@@ -2,7 +2,7 @@
 
 Bot officiel destiné à annoncer automatiquement les certifications émises par les certificateurs de confiance de Kelo Social.
 
-Le bot surveille les records AT Protocol `app.bsky.graph.verification` des comptes configurés dans `TRUSTED_VERIFIERS`, puis publie une annonce avec le compte défini par `BOT_IDENTIFIER`.
+Le bot surveille le registre AT Protocol Kelo Social `eu.kelosocial.certification` et publie une annonce dès qu'il détecte une nouvelle certification attribuée par un certificateur de confiance, ou un nouveau certificateur de confiance. Le scan est effectué toutes les 10 secondes par défaut.
 
 ## Variables d'environnement
 
@@ -13,8 +13,8 @@ Le bot surveille les records AT Protocol `app.bsky.graph.verification` des compt
 | `BOT_SERVICE` | URL du PDS du compte bot, par exemple `https://pds.kelosocial.eu` |
 | `TRUSTED_VERIFIERS` | Handles ou DIDs des certificateurs de confiance, séparés par des virgules |
 | `PUBLIC_APPVIEW` | AppView utilisé pour résoudre les handles et profils |
-| `POLL_INTERVAL_MS` | Intervalle entre deux scans, 60000 par défaut |
-| `STARTUP_GRACE_MS` | Fenêtre reprise après redémarrage, 300000 par défaut |
+| `POLL_INTERVAL_MS` | Intervalle entre deux scans, 10000 ms par défaut (minimum 10000) |
+
 
 Ne jamais mettre le vrai mot de passe dans GitHub. Utiliser les variables secrètes de Render.
 
@@ -51,4 +51,4 @@ Certification délivrée par un certificateur de confiance.
 - publication automatique avec le compte du bot ;
 - déduplication en mémoire pendant l'exécution.
 
-Pour une disponibilité réellement continue, utiliser un hébergement qui ne met pas le service en veille. Un Web Service Render gratuit peut s'endormir lorsqu'il ne reçoit pas de trafic entrant.
+Le bot vérifie le registre toutes les 10 secondes et publie lors du scan suivant la détection. Cela ne constitue pas un flux instantané événementiel. Pour une disponibilité continue, le service doit rester actif : un Web Service Render gratuit peut s'endormir lorsqu'il ne reçoit pas de trafic entrant.
