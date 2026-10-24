@@ -18,8 +18,8 @@ services:
       - key: CERTIFICATION_REPO
         value: kelosocial.eu
       - key: CERTIFICATION_PDS
-        value: https://eurosky.social
+        value: https://pds.kelosocial.eu
       - key: PUBLIC_APPVIEW
         value: https://public.api.bsky.app
       - key: POLL_INTERVAL_MS
-        value: 900000
+        value: 10000
