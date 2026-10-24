@@ -6,7 +6,7 @@ import { AtpAgent } from '@atproto/api'
 const COLLECTION = 'eu.kelosocial.certification'
 const MARKER_COLLECTION = 'eu.kelosocial.botverification.seen'
 const CERTIFICATION_REPO = process.env.CERTIFICATION_REPO || 'kelosocial.eu'
-const CERTIFICATION_PDS = process.env.CERTIFICATION_PDS || 'https://pds.kelosocial.eu'
+const CERTIFICATION_PDS = process.env.CERTIFICATION_PDS || 'https://eurosky.social'
 const BOT_SERVICE = process.env.BOT_SERVICE || 'https://eurosky.social'
 const BOT_IDENTIFIER = process.env.BOT_IDENTIFIER
 const BOT_PASSWORD = process.env.BOT_PASSWORD
